@@ -13,8 +13,8 @@ import (
 // finishing them during a shutdown.
 const drainExitCode = 255
 
-// maxLogWriteTime bounds each transaction log flush during a drain, so that
-// a stuck filesystem cannot hold up the rest of the drain.
+// maxLogWriteTime bounds each transaction log flush or fsync during a drain,
+// so that a stuck filesystem cannot hold up the rest of the drain.
 const maxLogWriteTime = time.Second
 
 // drain gives active runs up to the shutdown grace period to finish.
@@ -29,8 +29,8 @@ const maxLogWriteTime = time.Second
 // and runs that are still open are finished with drainExitCode, even if some
 // connection is slow to finish closing.
 //
-// The end of the grace period is reserved for a final flush, so that records
-// that arrived during the drain also reach the file.
+// The end of the grace period is reserved for a final flush and fsync, so
+// that records that arrived during the drain also reach the disk.
 //
 // It returns within the grace period, and soon after ForceStop.
 func (s *Server) drain() {
@@ -50,7 +50,7 @@ func (s *Server) drain() {
 		all := slices.Concat(streams, finishing, s.streamMux.Streams())
 		finishingMu.Unlock()
 
-		s.writeLogsUntil(s.flushLogs, all, end)
+		s.writeLogsUntil(s.syncLogs, all, end)
 	}()
 	s.writeLogsUntil(s.flushLogs, streams, finalFlushStart)
 

@@ -105,3 +105,13 @@ func FlushTransactionLogs(streams []*Stream) {
 	}
 	wg.Wait()
 }
+
+// SyncTransactionLogs is like FlushTransactionLogs, but also persists each
+// file with fsync.
+func SyncTransactionLogs(streams []*Stream) {
+	var wg sync.WaitGroup
+	for _, stream := range streams {
+		wg.Go(stream.SyncTransactionLog)
+	}
+	wg.Wait()
+}

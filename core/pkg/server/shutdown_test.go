@@ -118,6 +118,7 @@ func blockFlushes(t *testing.T) func(*Server) {
 	t.Cleanup(func() { close(release) })
 	return func(s *Server) {
 		s.flushLogs = func([]*stream.Stream) { <-release }
+		s.syncLogs = func([]*stream.Stream) { <-release }
 	}
 }
 

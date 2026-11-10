@@ -55,6 +55,10 @@ type Server struct {
 	// flushLogs flushes streams' transaction logs during a drain.
 	flushLogs func([]*stream.Stream)
 
+	// syncLogs flushes and fsyncs streams' transaction logs at the end of
+	// a drain.
+	syncLogs func([]*stream.Stream)
+
 	// finishStreams finishes and closes the open streams during a drain.
 	finishStreams func(streams []*stream.Stream, exitCode int32)
 
@@ -162,6 +166,7 @@ func NewServer(params ServerParams) *Server {
 		drainCh:              make(chan struct{}),
 		shutdownGracePeriod:  params.ShutdownGracePeriod,
 		flushLogs:            stream.FlushTransactionLogs,
+		syncLogs:             stream.SyncTransactionLogs,
 		streamMux:            streamMux,
 		finishStreams:        stream.FinishAndCloseStreams,
 		runSyncManager:       runsync.NewRunSyncManager(),

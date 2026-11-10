@@ -465,3 +465,15 @@ func (s *Stream) FlushTransactionLog() {
 		}
 	}
 }
+
+// SyncTransactionLog writes records already buffered by the transaction log
+// writer to the file and persists it with fsync.
+//
+// It does not wait for queued records or network uploads.
+func (s *Stream) SyncTransactionLog() {
+	if w := s.transactionWriter.Load(); w != nil {
+		if err := w.Sync(); err != nil {
+			s.logger.Error("stream: failed to sync transaction log", "error", err)
+		}
+	}
+}
