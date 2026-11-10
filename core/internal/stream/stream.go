@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Khan/genqlient/graphql"
@@ -82,6 +83,9 @@ type Stream struct {
 
 	// writerFactory is used to create the Writer component
 	writerFactory *WriterFactory
+
+	// transactionWriter is the run's transaction log writer, if any.
+	transactionWriter atomic.Pointer[Writer]
 
 	// flowControlFactory is used to create the FlowControl component
 	flowControlFactory *FlowControlFactory
@@ -215,6 +219,7 @@ func (s *Stream) maybeSavingToTransactionLog(
 	}
 
 	writer := s.writerFactory.New(w)
+	s.transactionWriter.Store(writer)
 	flowControl := s.flowControlFactory.New(
 		r, writer.Flush, s.recordParser,
 		FlowControlParams{
@@ -381,4 +386,16 @@ func (s *Stream) runURLAndName() (string, string, error) {
 	}
 
 	return url, upserter.DisplayName(), nil
+}
+
+// FlushTransactionLog writes records already buffered by the transaction log
+// writer to the file.
+//
+// It does not wait for queued records or network uploads.
+func (s *Stream) FlushTransactionLog() {
+	if w := s.transactionWriter.Load(); w != nil {
+		if err := w.Flush(); err != nil {
+			s.logger.Error("stream: failed to flush transaction log", "error", err)
+		}
+	}
 }

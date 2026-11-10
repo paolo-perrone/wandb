@@ -39,7 +39,18 @@ type Server struct {
 
 	// forceShutdown reports whether Serve should return without waiting for
 	// in-flight connections to finish.
-	forceShutdown bool
+	forceShutdown atomic.Bool
+
+	// forceCh is closed by ForceStop.
+	forceCh   chan struct{}
+	forceOnce sync.Once
+
+	// drainCh is closed by Shutdown to start a bounded drain.
+	drainCh   chan struct{}
+	drainOnce sync.Once
+
+	// shutdownGracePeriod bounds the drain started by Shutdown.
+	shutdownGracePeriod time.Duration
 
 	// streamMux maps stream IDs to streams.
 	streamMux *stream.StreamMux
@@ -98,8 +109,27 @@ type Server struct {
 
 // ForceStop shuts down the server without waiting for in-flight work.
 func (s *Server) ForceStop() {
-	s.forceShutdown = true
+	s.forceShutdown.Store(true)
+	s.forceOnce.Do(func() { close(s.forceCh) })
 	s.stopServer()
+}
+
+// Shutdown stops accepting connections and gives active runs up to the
+// grace period to finish before the server stops.
+//
+// Existing connections stay open for the first half of the grace period, so
+// a client that is already finishing its run (for example, from its own
+// SIGTERM handler) can complete. Then remaining connections are closed and
+// runs left open are finished with exit code 255. ForceStop ends the drain
+// early. See drain.
+//
+// A grace period of zero or less is the same as ForceStop.
+func (s *Server) Shutdown() {
+	if s.shutdownGracePeriod <= 0 {
+		s.ForceStop()
+		return
+	}
+	s.drainOnce.Do(func() { close(s.drainCh) })
 }
 
 type ServerParams struct {
@@ -111,6 +141,7 @@ type ServerParams struct {
 	ParentPID           int
 	Detached            bool
 	IdleTimeout         time.Duration
+	ShutdownGracePeriod time.Duration
 }
 
 func NewServer(params ServerParams) *Server {
@@ -119,6 +150,9 @@ func NewServer(params ServerParams) *Server {
 	return &Server{
 		serverLifetimeCtx:    serverLifetimeCtx,
 		stopServer:           stopServer,
+		forceCh:              make(chan struct{}),
+		drainCh:              make(chan struct{}),
+		shutdownGracePeriod:  params.ShutdownGracePeriod,
 		streamMux:            stream.NewStreamMux(),
 		runSyncManager:       runsync.NewRunSyncManager(),
 		sweepSchedBroker:     scheduler.NewIPCSessionBroker(scheduler.NewTaskResolver),
@@ -138,15 +172,21 @@ func NewServer(params ServerParams) *Server {
 func (s *Server) exitWhenParentIsGone() {
 	slog.Info("server: will exit if parent process dies", "ppid", s.parentPID)
 
+	ticker := time.NewTicker(IntervalCheckParentPidMilliseconds * time.Millisecond)
+	defer ticker.Stop()
 	for os.Getppid() == s.parentPID {
-		time.Sleep(IntervalCheckParentPidMilliseconds * time.Millisecond)
+		select {
+		case <-s.serverLifetimeCtx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 
 	slog.Info("server: parent process exited, terminating service process")
 
-	// The user process has exited, so there's no need to sync
-	// uncommitted data, and we can quit immediately.
-	s.ForceStop()
+	// The client can no longer finish its runs, but data it already sent
+	// may still be buffered here.
+	s.Shutdown()
 }
 
 func closeAll(listenerList []net.Listener) {
@@ -193,7 +233,16 @@ func (s *Server) Serve(portFile string) error {
 	}
 
 	// Wait for the signal to shut down.
-	<-s.serverLifetimeCtx.Done()
+	select {
+	case <-s.serverLifetimeCtx.Done():
+	case <-s.drainCh:
+		slog.Info("server: draining", "grace-period", s.shutdownGracePeriod)
+		s.stopIdleTimer()
+		closeListeners()
+		s.drain()
+		s.stopServer()
+		return nil
+	}
 	slog.Info("server: is shutting down")
 
 	s.stopIdleTimer()
@@ -201,7 +250,7 @@ func (s *Server) Serve(portFile string) error {
 	// Stop accepting new connections.
 	closeListeners()
 
-	if s.forceShutdown {
+	if s.forceShutdown.Load() {
 		slog.Info("server: forced shutdown")
 		return nil
 	}

@@ -82,3 +82,20 @@ func (sm *StreamMux) FinishAndCloseAllStreams(exitCode int32) {
 	wg.Wait()
 	slog.Debug("all streams were closed")
 }
+
+// Streams returns the streams currently in the mux.
+func (sm *StreamMux) Streams() []*Stream {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+	return slices.Collect(maps.Values(sm.mux))
+}
+
+// FlushTransactionLogs writes each stream's buffered transaction log records
+// to its file, independently of network uploads.
+func FlushTransactionLogs(streams []*Stream) {
+	var wg sync.WaitGroup
+	for _, stream := range streams {
+		wg.Go(stream.FlushTransactionLog)
+	}
+	wg.Wait()
+}

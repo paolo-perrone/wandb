@@ -48,6 +48,10 @@ const (
 
 	defaultDetachedIdleTimeout = 10 * time.Minute
 
+	// defaultShutdownGracePeriod is how long a signal or parent exit waits
+	// for active runs to finish. Schedulers commonly allow 30s before SIGKILL.
+	defaultShutdownGracePeriod = 5 * time.Second
+
 	// exitCodeSignal is used when the program shuts down due to a signal.
 	//
 	// A common convention is to use 128 plus the signal number, but Go's
@@ -87,6 +91,12 @@ func serviceMain() int {
 		"If --detached is set, shut down the service after this much idle time"+
 			" with no connected clients. 0 disables the idle shutdown.",
 	)
+	shutdownGracePeriod := flag.Duration(
+		"shutdown-grace-period",
+		defaultShutdownGracePeriod,
+		"On SIGINT, SIGTERM or parent exit, wait up to this long for active"+
+			" runs to finish. A second signal stops immediately. 0 disables it.",
+	)
 	logLevel := flag.Int("log-level", 0,
 		"Specifies the log level to use for logging. -4: debug, 0: info, 4: warn, 8: error.")
 	disableAnalytics := flag.Bool("no-observability", false,
@@ -124,6 +134,17 @@ func serviceMain() int {
 		fmt.Fprintln(os.Stderr, "Error: --idle-timeout must be >= 0")
 		return exitCodeErrorArgs
 	}
+
+	if *shutdownGracePeriod < 0 {
+		fmt.Fprintln(os.Stderr, "Error: --shutdown-grace-period must be >= 0")
+		return exitCodeErrorArgs
+	}
+
+	// Handle signals from here on: SIGTERM must start a drain rather than
+	// kill the process. A second signal forces an immediate stop.
+	signalCh := make(chan os.Signal, 2)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signalCh)
 
 	var shutdownOnParentExitEnabled bool
 	if *pid != 0 && *enableOsPidShutdown && !*detached {
@@ -167,10 +188,6 @@ func serviceMain() int {
 
 	analytics.ConfigureOTelErrorHandler(slog.Default())
 
-	// Record certain signals in the log file for debugging.
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
-
 	srv := server.NewServer(
 		server.ServerParams{
 			Commit:              commit,
@@ -181,6 +198,7 @@ func serviceMain() int {
 			ParentPID:           *pid,
 			Detached:            *detached,
 			IdleTimeout:         *idleTimeout,
+			ShutdownGracePeriod: *shutdownGracePeriod,
 		},
 	)
 	srvCh := make(chan error, 1)
@@ -198,8 +216,7 @@ func serviceMain() int {
 			}
 		case sig := <-signalCh:
 			slog.Info("main: received shutdown signal", "signal", sig)
-			srv.ForceStop()
-			if err := <-srvCh; err != nil {
+			if err := shutdownOnSignal(srv, srvCh, signalCh); err != nil {
 				slog.Error("main: Serve() returned error", "error", err)
 			}
 			return exitCodeSignal
@@ -725,4 +742,23 @@ func newModelParams(
 		params.RunParams = &leet.RunParams{Remote: opts.remoteRun}
 	}
 	return params, nil
+}
+
+// shutdownOnSignal drains the server and waits for Serve to return.
+//
+// Another signal during the drain forces an immediate stop.
+func shutdownOnSignal(
+	srv *server.Server,
+	srvCh <-chan error,
+	signalCh <-chan os.Signal,
+) error {
+	srv.Shutdown()
+	select {
+	case err := <-srvCh:
+		return err
+	case sig := <-signalCh:
+		slog.Info("main: received second signal, stopping now", "signal", sig)
+		srv.ForceStop()
+		return <-srvCh
+	}
 }
