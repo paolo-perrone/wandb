@@ -189,6 +189,8 @@ func TestShutdown_FinalFlushIncludesRunsCreatedDuringDrain(t *testing.T) {
 				require.NoError(t, s.streamMux.AddStream("run-b", runB))
 			}
 		}
+		// The final flush also fsyncs; record it the same way.
+		s.syncLogs = s.flushLogs
 		// Finishing removes run B from the mux, and its uploads stall.
 		s.finishStreams = func([]*stream.Stream, int32) { <-releaseFinish }
 	})
