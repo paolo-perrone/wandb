@@ -59,8 +59,8 @@ func (sm *StreamMux) RemoveStream(streamId string) (*Stream, error) {
 	}
 }
 
-// popAllStreams removes all streams from the mux and returns them.
-func (sm *StreamMux) popAllStreams() []*Stream {
+// PopAllStreams removes all streams from the mux and returns them.
+func (sm *StreamMux) PopAllStreams() []*Stream {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
 
@@ -73,8 +73,14 @@ func (sm *StreamMux) popAllStreams() []*Stream {
 //
 // Blocks until all streams are done.
 func (sm *StreamMux) FinishAndCloseAllStreams(exitCode int32) {
+	FinishAndCloseStreams(sm.PopAllStreams(), exitCode)
+}
+
+// FinishAndCloseStreams finishes and closes the streams concurrently and
+// waits for all of them.
+func FinishAndCloseStreams(streams []*Stream, exitCode int32) {
 	wg := sync.WaitGroup{}
-	for _, stream := range sm.popAllStreams() {
+	for _, stream := range streams {
 		wg.Go(func() {
 			stream.FinishAndClose(exitCode)
 		})

@@ -2,6 +2,7 @@ package server
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,7 +151,7 @@ func TestShutdown_ForceStopInterruptsStuckLogFlush(t *testing.T) {
 func TestShutdown_StalledConnectionDoesNotSkipFinishingRuns(t *testing.T) {
 	finished := make(chan int32, 1)
 	s, _, srvCh := startServerForShutdownTest(t, time.Second, func(s *Server) {
-		s.finishStreams = func(exitCode int32) { finished <- exitCode }
+		s.finishStreams = func(_ []*stream.Stream, exitCode int32) { finished <- exitCode }
 	})
 
 	// A connection that never finishes closing, such as one stuck in
@@ -168,4 +169,35 @@ func TestShutdown_StalledConnectionDoesNotSkipFinishingRuns(t *testing.T) {
 	default:
 		t.Fatal("runs were not finished")
 	}
+}
+
+func TestShutdown_FinalFlushIncludesRunsCreatedDuringDrain(t *testing.T) {
+	runB := &stream.Stream{}
+	var mu sync.Mutex
+	var flushes [][]*stream.Stream
+	releaseFinish := make(chan struct{})
+	t.Cleanup(func() { close(releaseFinish) })
+
+	s, closeClient, srvCh := startServerForShutdownTest(t, time.Second, func(s *Server) {
+		s.flushLogs = func(streams []*stream.Stream) {
+			mu.Lock()
+			defer mu.Unlock()
+			flushes = append(flushes, streams)
+			if len(flushes) == 1 {
+				// A client creates run B after the drain's first flush.
+				require.NoError(t, s.streamMux.AddStream("run-b", runB))
+			}
+		}
+		// Finishing removes run B from the mux, and its uploads stall.
+		s.finishStreams = func([]*stream.Stream, int32) { <-releaseFinish }
+	})
+	closeClient()
+
+	s.Shutdown()
+	requireServeReturnsWithin(t, srvCh, 5*time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, flushes, 2)
+	require.Contains(t, flushes[1], runB, "the final flush must include run B")
 }

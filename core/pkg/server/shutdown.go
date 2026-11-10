@@ -2,6 +2,8 @@ package server
 
 import (
 	"log/slog"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/wandb/wandb/core/internal/stream"
@@ -37,15 +39,18 @@ func (s *Server) drain() {
 	finalFlushStart := end.Add(-min(maxLogWriteTime, grace/5))
 	clientDeadline := time.Now().Add(time.Until(finalFlushStart) / 2)
 
-	// Capture the streams now: finishing a stream removes it from the mux.
-	// The final flush also covers runs started during the drain.
+	// Finishing a stream removes it from the mux, so keep references to
+	// every stream: those open now, those being finished, and any still in
+	// the mux at the end, such as runs started during the drain.
 	streams := s.streamMux.Streams()
+	var finishingMu sync.Mutex
+	var finishing []*stream.Stream
 	defer func() {
-		s.writeLogsUntil(
-			s.flushLogs,
-			append(streams, s.streamMux.Streams()...),
-			end,
-		)
+		finishingMu.Lock()
+		all := slices.Concat(streams, finishing, s.streamMux.Streams())
+		finishingMu.Unlock()
+
+		s.writeLogsUntil(s.flushLogs, all, end)
 	}()
 	s.writeLogsUntil(s.flushLogs, streams, finalFlushStart)
 
@@ -57,7 +62,12 @@ func (s *Server) drain() {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		s.finishStreams(drainExitCode)
+		popped := s.streamMux.PopAllStreams()
+		finishingMu.Lock()
+		finishing = popped
+		finishingMu.Unlock()
+
+		s.finishStreams(popped, drainExitCode)
 	}()
 
 	select {
