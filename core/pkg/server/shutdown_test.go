@@ -146,3 +146,26 @@ func TestShutdown_ForceStopInterruptsStuckLogFlush(t *testing.T) {
 	requireServeReturnsWithin(t, srvCh, 5*time.Second)
 	require.Less(t, time.Since(start), 300*time.Millisecond)
 }
+
+func TestShutdown_StalledConnectionDoesNotSkipFinishingRuns(t *testing.T) {
+	finished := make(chan int32, 1)
+	s, _, srvCh := startServerForShutdownTest(t, time.Second, func(s *Server) {
+		s.finishStreams = func(exitCode int32) { finished <- exitCode }
+	})
+
+	// A connection that never finishes closing, such as one stuck in
+	// cleanup after it is cancelled.
+	stalled := make(chan struct{})
+	t.Cleanup(func() { close(stalled) })
+	s.connectionsWG.Go(func() { <-stalled })
+
+	s.Shutdown()
+
+	requireServeReturnsWithin(t, srvCh, 5*time.Second)
+	select {
+	case exitCode := <-finished:
+		require.EqualValues(t, drainExitCode, exitCode)
+	default:
+		t.Fatal("runs were not finished")
+	}
+}

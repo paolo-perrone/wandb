@@ -2,6 +2,10 @@
 
 With SHUTDOWN_APP_FINISHES=1, SIGTERM makes the script log one more row and
 finish the run with exit code 3, like an application that handles SIGTERM.
+
+With SHUTDOWN_EXIT_THEN_WAIT=1, the script sends the run's exit record with
+code 3 but never tells wandb-core the run is finished, like a process killed
+in the middle of run.finish().
 """
 
 import json
@@ -40,6 +44,9 @@ if os.environ.get("SHUTDOWN_APP_FINISHES") == "1":
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, finish_on_sigterm)
+
+if os.environ.get("SHUTDOWN_EXIT_THEN_WAIT") == "1":
+    run._interface.deliver_exit(3).wait_or(timeout=10)
 
 # A round trip after logging ensures wandb-core has received the records.
 run._interface.deliver_get_summary().wait_or(timeout=10)

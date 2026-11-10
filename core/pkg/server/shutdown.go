@@ -23,9 +23,9 @@ const maxLogWriteTime = time.Second
 // For the first half of the remaining time, existing connections stay open:
 // a client that is finishing its run (for example, from its own SIGTERM
 // handler) can complete it, and a client that sends a teardown request shuts
-// the server down as usual. Connections still open after that are closed.
-// Once every connection has closed, runs that are still open are finished
-// with drainExitCode.
+// the server down as usual. Connections still open after that are closed,
+// and runs that are still open are finished with drainExitCode, even if some
+// connection is slow to finish closing.
 //
 // The end of the grace period is reserved for a final flush, so that records
 // that arrived during the drain also reach the file.
@@ -49,14 +49,15 @@ func (s *Server) drain() {
 	}()
 	s.writeLogsUntil(s.flushLogs, streams, finalFlushStart)
 
-	if !s.waitForClients(clientDeadline, finalFlushStart) {
+	closeWait := clientDeadline.Add(time.Until(finalFlushStart) / 4)
+	if !s.waitForClients(clientDeadline, closeWait) {
 		return
 	}
 
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		s.streamMux.FinishAndCloseAllStreams(drainExitCode)
+		s.finishStreams(drainExitCode)
 	}()
 
 	select {
@@ -71,9 +72,12 @@ func (s *Server) drain() {
 
 // waitForClients waits for every connection to close.
 //
-// Connections still open at clientDeadline are closed. It returns false if
-// they have not all closed by giveUp, or on ForceStop.
-func (s *Server) waitForClients(clientDeadline, giveUp time.Time) bool {
+// Connections still open at clientDeadline are closed, and it waits for them
+// until closeWait. A connection that is still closing then is left to finish
+// on its own: records it adds to a run after the run is finished are dropped.
+//
+// It returns false only on ForceStop.
+func (s *Server) waitForClients(clientDeadline, closeWait time.Time) bool {
 	connectionsDone := s.waitForConnectionsToFinish()
 
 	select {
@@ -90,9 +94,9 @@ func (s *Server) waitForClients(clientDeadline, giveUp time.Time) bool {
 	select {
 	case <-connectionsDone:
 		return true
-	case <-time.After(time.Until(giveUp)):
-		slog.Warn("server: shutdown grace period expired closing connections")
-		return false
+	case <-time.After(time.Until(closeWait)):
+		slog.Warn("server: connections still closing, finishing runs anyway")
+		return true
 	case <-s.forceCh:
 		slog.Warn("server: shutdown forced while closing connections")
 		return false

@@ -55,6 +55,9 @@ type Server struct {
 	// flushLogs flushes streams' transaction logs during a drain.
 	flushLogs func([]*stream.Stream)
 
+	// finishStreams finishes and closes the open streams during a drain.
+	finishStreams func(exitCode int32)
+
 	// streamMux maps stream IDs to streams.
 	streamMux *stream.StreamMux
 
@@ -150,6 +153,8 @@ type ServerParams struct {
 func NewServer(params ServerParams) *Server {
 	serverLifetimeCtx, stopServer := context.WithCancel(context.Background())
 
+	streamMux := stream.NewStreamMux()
+
 	return &Server{
 		serverLifetimeCtx:    serverLifetimeCtx,
 		stopServer:           stopServer,
@@ -157,7 +162,8 @@ func NewServer(params ServerParams) *Server {
 		drainCh:              make(chan struct{}),
 		shutdownGracePeriod:  params.ShutdownGracePeriod,
 		flushLogs:            stream.FlushTransactionLogs,
-		streamMux:            stream.NewStreamMux(),
+		streamMux:            streamMux,
+		finishStreams:        streamMux.FinishAndCloseAllStreams,
 		runSyncManager:       runsync.NewRunSyncManager(),
 		sweepSchedBroker:     scheduler.NewIPCSessionBroker(scheduler.NewTaskResolver),
 		symonResourceManager: monitor.NewSymonResourceManager(params.EnableDCGMProfiling),

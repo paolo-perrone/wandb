@@ -29,6 +29,10 @@ type shutdownScenario struct {
 	// appFinishes makes testdata/shutdown.py finish its run on SIGTERM.
 	appFinishes bool
 
+	// exitThenWait makes testdata/shutdown.py send its exit record and
+	// then wait without finishing the run.
+	exitThenWait bool
+
 	// stop stops the processes.
 	stop func(t *testing.T, worker *os.Process, corePID int)
 
@@ -80,6 +84,18 @@ func TestShutdownProcess_PreservesOfflineRun(t *testing.T) {
 			wantExitCode: exitCode(3),
 		},
 		{
+			// The app is killed after its run's exit record but before it
+			// tells wandb-core the run is finished. The drain must not add a
+			// second exit record, which would make the log fail to sync.
+			name:         "parent killed after exit",
+			exitThenWait: true,
+			stop: func(t *testing.T, worker *os.Process, _ int) {
+				require.NoError(t, worker.Kill())
+			},
+			wantRows:     25,
+			wantExitCode: exitCode(3),
+		},
+		{
 			// Control: SIGKILL runs no shutdown code, so buffered rows are lost.
 			name: "sigkill control",
 			stop: func(t *testing.T, _ *os.Process, corePID int) {
@@ -92,7 +108,7 @@ func TestShutdownProcess_PreservesOfflineRun(t *testing.T) {
 	for _, sc := range scenarios {
 		t.Run(sc.name, func(t *testing.T) {
 			logFile := runShutdownScenario(t, python, sdkRoot, sc)
-			rows, code := readHistoryAndExit(t, logFile)
+			rows, code, exits := readHistoryAndExit(t, logFile)
 
 			if sc.wantRows < 0 {
 				require.Less(t, rows, 25)
@@ -104,6 +120,7 @@ func TestShutdownProcess_PreservesOfflineRun(t *testing.T) {
 			} else {
 				require.NotNil(t, code, "no exit record")
 				require.Equal(t, *sc.wantExitCode, *code)
+				require.Equal(t, 1, exits, "exactly one exit record")
 			}
 		})
 	}
@@ -135,6 +152,9 @@ func runShutdownScenario(
 	)
 	if sc.appFinishes {
 		worker.Env = append(worker.Env, "SHUTDOWN_APP_FINISHES=1")
+	}
+	if sc.exitThenWait {
+		worker.Env = append(worker.Env, "SHUTDOWN_EXIT_THEN_WAIT=1")
 	}
 	log, err := os.Create(filepath.Join(root, "worker.log"))
 	require.NoError(t, err)
@@ -170,21 +190,22 @@ while psutil.pid_exists(pid):
 	require.NoError(t, wait.Run())
 }
 
-// readHistoryAndExit counts history records and returns the last exit code.
+// readHistoryAndExit counts history records and exit records, and returns
+// the last exit code.
 //
 // A partially written last block ends the read.
-func readHistoryAndExit(t *testing.T, logFile string) (int, *int32) {
+func readHistoryAndExit(t *testing.T, logFile string) (int, *int32, int) {
 	t.Helper()
 	reader, err := transactionlog.OpenReader(logFile, observability.NewNoOpLogger())
 	require.NoError(t, err)
 	defer reader.Close()
 
-	var rows int
+	var rows, exits int
 	var code *int32
 	for {
 		record, err := reader.Read()
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return rows, code
+			return rows, code, exits
 		}
 		require.NoError(t, err)
 		if record.GetHistory() != nil {
@@ -193,6 +214,7 @@ func readHistoryAndExit(t *testing.T, logFile string) (int, *int32) {
 		if exit := record.GetExit(); exit != nil {
 			value := exit.ExitCode
 			code = &value
+			exits++
 		}
 	}
 }

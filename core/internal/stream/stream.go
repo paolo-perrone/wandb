@@ -87,6 +87,9 @@ type Stream struct {
 	// transactionWriter is the run's transaction log writer, if any.
 	transactionWriter atomic.Pointer[Writer]
 
+	// exitReceived is set once the stream has been given an exit record.
+	exitReceived atomic.Bool
+
 	// flowControlFactory is used to create the FlowControl component
 	flowControlFactory *FlowControlFactory
 
@@ -247,6 +250,10 @@ func (s *Stream) maybeSavingToTransactionLog(
 func (s *Stream) HandleRecord(record *spb.Record, request *runwork.Request) {
 	s.logger.Debug("handling record", "record", record.GetRecordType())
 
+	if record.GetExit() != nil {
+		s.exitReceived.Store(true)
+	}
+
 	work := runwork.Work{
 		WorkImpl: s.recordParser.Parse(record),
 		Request:  request,
@@ -292,12 +299,22 @@ func (s *Stream) Close() {
 
 // FinishAndClose emits an exit record, closes the stream and prints a footer.
 //
-// In contrast to Close, this assumes that an exit record has not and will
-// not be pushed by any other source. If there has already been an exit record,
-// this may shut down the run abruptly.
+// In contrast to Close, this does not require an exit record. If the stream
+// has already been given one, this only closes the stream. An exit record
+// pushed by another source concurrently may still shut down the run abruptly.
 //
 // This is used to shut down the stream if the client didn't do it explicitly.
 func (s *Stream) FinishAndClose(exitCode int32) {
+	// A client can send the exit record and then disconnect before telling
+	// us the run finished. A second exit record would be saved to the
+	// transaction log, and syncing the log later would fail on it.
+	if s.exitReceived.Load() {
+		s.logger.Info("stream: already received exit, closing")
+		s.Close()
+		s.printFooter()
+		return
+	}
+
 	// Use a synthetic exit request to detect when uploads finish.
 	exitCtx, cancelExit := context.WithCancel(context.Background())
 	exitResponse := make(chan *spb.ServerResponse, 1)
