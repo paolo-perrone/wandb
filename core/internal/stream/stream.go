@@ -87,8 +87,11 @@ type Stream struct {
 	// transactionWriter is the run's transaction log writer, if any.
 	transactionWriter atomic.Pointer[Writer]
 
-	// exitReceived is set once the stream has been given an exit record.
-	exitReceived atomic.Bool
+	// exitQueued is set when the stream is given its first exit record.
+	//
+	// The channel is closed once that record is added to runWork, which
+	// can happen later: see RunExitWork.
+	exitQueued atomic.Pointer[chan struct{}]
 
 	// flowControlFactory is used to create the FlowControl component
 	flowControlFactory *FlowControlFactory
@@ -250,16 +253,23 @@ func (s *Stream) maybeSavingToTransactionLog(
 func (s *Stream) HandleRecord(record *spb.Record, request *runwork.Request) {
 	s.logger.Debug("handling record", "record", record.GetRecordType())
 
-	if record.GetExit() != nil {
-		s.exitReceived.Store(true)
-	}
-
 	work := runwork.Work{
 		WorkImpl: s.recordParser.Parse(record),
 		Request:  request,
 	}
 
-	work.Schedule(&sync.WaitGroup{}, func() { s.runWork.AddWork(work) })
+	proceed := func() { s.runWork.AddWork(work) }
+	if record.GetExit() != nil {
+		queued := make(chan struct{})
+		if s.exitQueued.CompareAndSwap(nil, &queued) {
+			proceed = func() {
+				s.runWork.AddWork(work)
+				close(queued)
+			}
+		}
+	}
+
+	work.Schedule(&sync.WaitGroup{}, proceed)
 }
 
 // Close closes the stream and blocks until all its work is processed.
@@ -308,8 +318,13 @@ func (s *Stream) FinishAndClose(exitCode int32) {
 	// A client can send the exit record and then disconnect before telling
 	// us the run finished. A second exit record would be saved to the
 	// transaction log, and syncing the log later would fail on it.
-	if s.exitReceived.Load() {
+	//
+	// The client's exit record may not be queued yet, for example while
+	// the TensorBoard integration finishes. Closing before then would
+	// drop it, so wait.
+	if queued := s.exitQueued.Load(); queued != nil {
 		s.logger.Info("stream: already received exit, closing")
+		<-*queued
 		s.Close()
 		s.printFooter()
 		return
