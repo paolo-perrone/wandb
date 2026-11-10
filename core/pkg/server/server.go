@@ -52,6 +52,9 @@ type Server struct {
 	// shutdownGracePeriod bounds the drain started by Shutdown.
 	shutdownGracePeriod time.Duration
 
+	// flushLogs flushes streams' transaction logs during a drain.
+	flushLogs func([]*stream.Stream)
+
 	// streamMux maps stream IDs to streams.
 	streamMux *stream.StreamMux
 
@@ -153,6 +156,7 @@ func NewServer(params ServerParams) *Server {
 		forceCh:              make(chan struct{}),
 		drainCh:              make(chan struct{}),
 		shutdownGracePeriod:  params.ShutdownGracePeriod,
+		flushLogs:            stream.FlushTransactionLogs,
 		streamMux:            stream.NewStreamMux(),
 		runSyncManager:       runsync.NewRunSyncManager(),
 		sweepSchedBroker:     scheduler.NewIPCSessionBroker(scheduler.NewTaskResolver),

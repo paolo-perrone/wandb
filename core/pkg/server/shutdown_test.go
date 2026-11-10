@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/wandb/wandb/core/internal/stream"
 )
 
 // startServerForShutdownTest runs Serve with one open client connection.
@@ -14,12 +16,16 @@ import (
 func startServerForShutdownTest(
 	t *testing.T,
 	grace time.Duration,
+	configure ...func(*Server),
 ) (*Server, func(), <-chan error) {
 	t.Helper()
 	tempRoot := t.TempDir()
 	t.Setenv("TMPDIR", tempRoot)
 
 	s := NewServer(ServerParams{Detached: true, ShutdownGracePeriod: grace})
+	for _, f := range configure {
+		f(s)
+	}
 	srvCh := make(chan error, 1)
 	go func() { srvCh <- s.Serve(filepath.Join(tempRoot, "port.txt")) }()
 
@@ -66,8 +72,10 @@ func TestShutdown_ClosesConnectionsAfterHalfTheGracePeriod(t *testing.T) {
 
 	requireServeReturnsWithin(t, srvCh, 5*time.Second)
 	elapsed := time.Since(start)
-	require.GreaterOrEqual(t, elapsed, 300*time.Millisecond,
-		"clients get half the grace period")
+	// Clients get half of the grace period left after the final flush's
+	// reserve, which is a fifth of 600ms.
+	require.GreaterOrEqual(t, elapsed, 240*time.Millisecond,
+		"clients get about half the grace period")
 	require.Less(t, elapsed, 600*time.Millisecond,
 		"an idle client must not hold the drain for the full grace period")
 }
@@ -100,4 +108,41 @@ func TestShutdown_RepeatedCallsAreSafe(t *testing.T) {
 	closeClient()
 
 	requireServeReturnsWithin(t, srvCh, 5*time.Second)
+}
+
+// blockFlushes makes the server's transaction log flushes hang, like
+// writes to a stuck filesystem.
+func blockFlushes(t *testing.T) func(*Server) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	return func(s *Server) {
+		s.flushLogs = func([]*stream.Stream) { <-release }
+	}
+}
+
+func TestShutdown_StuckLogFlushStaysWithinGracePeriod(t *testing.T) {
+	s, closeClient, srvCh := startServerForShutdownTest(
+		t, 500*time.Millisecond, blockFlushes(t))
+	closeClient()
+
+	start := time.Now()
+	s.Shutdown()
+
+	requireServeReturnsWithin(t, srvCh, 5*time.Second)
+	require.Less(t, time.Since(start), 650*time.Millisecond,
+		"flushes must fit in the grace period")
+}
+
+func TestShutdown_ForceStopInterruptsStuckLogFlush(t *testing.T) {
+	s, closeClient, srvCh := startServerForShutdownTest(
+		t, time.Minute, blockFlushes(t))
+	closeClient()
+
+	s.Shutdown()
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	s.ForceStop()
+
+	requireServeReturnsWithin(t, srvCh, 5*time.Second)
+	require.Less(t, time.Since(start), 300*time.Millisecond)
 }
