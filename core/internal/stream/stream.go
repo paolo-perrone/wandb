@@ -87,10 +87,12 @@ type Stream struct {
 	// transactionWriter is the run's transaction log writer, if any.
 	transactionWriter atomic.Pointer[Writer]
 
-	// exitQueued is set when the stream is given its first exit record.
+	// exitQueued is set by whichever exit record claims the stream first:
+	// the client's, or the one FinishAndClose creates. Later exit records
+	// are dropped, so that the transaction log has only one.
 	//
-	// The channel is closed once that record is added to runWork, which
-	// can happen later: see RunExitWork.
+	// The channel is closed once the claiming record is added to runWork,
+	// which can happen later: see RunExitWork.
 	exitQueued atomic.Pointer[chan struct{}]
 
 	// flowControlFactory is used to create the FlowControl component
@@ -253,19 +255,50 @@ func (s *Stream) maybeSavingToTransactionLog(
 func (s *Stream) HandleRecord(record *spb.Record, request *runwork.Request) {
 	s.logger.Debug("handling record", "record", record.GetRecordType())
 
+	var queued chan struct{}
+	if record.GetExit() != nil {
+		// Claim the stream before parsing, so that FinishAndClose cannot
+		// add its own exit record while this one is being handled.
+		if queued = s.claimExit(); queued == nil {
+			s.logger.Warn("stream: ignoring exit record after the first")
+			request.WillNotRespond()
+			return
+		}
+	}
+
+	s.scheduleRecord(record, request, queued)
+}
+
+// claimExit claims the stream's exit for the caller.
+//
+// It returns a channel to close once the caller's exit record is added to
+// runWork, or nil if another exit record has already claimed the stream.
+func (s *Stream) claimExit() chan struct{} {
+	queued := make(chan struct{})
+	if s.exitQueued.CompareAndSwap(nil, &queued) {
+		return queued
+	}
+	return nil
+}
+
+// scheduleRecord parses a record and adds it to runWork.
+//
+// If queued is not nil, it is closed once the record is added.
+func (s *Stream) scheduleRecord(
+	record *spb.Record,
+	request *runwork.Request,
+	queued chan struct{},
+) {
 	work := runwork.Work{
 		WorkImpl: s.recordParser.Parse(record),
 		Request:  request,
 	}
 
 	proceed := func() { s.runWork.AddWork(work) }
-	if record.GetExit() != nil {
-		queued := make(chan struct{})
-		if s.exitQueued.CompareAndSwap(nil, &queued) {
-			proceed = func() {
-				s.runWork.AddWork(work)
-				close(queued)
-			}
+	if queued != nil {
+		proceed = func() {
+			s.runWork.AddWork(work)
+			close(queued)
 		}
 	}
 
@@ -310,8 +343,8 @@ func (s *Stream) Close() {
 // FinishAndClose emits an exit record, closes the stream and prints a footer.
 //
 // In contrast to Close, this does not require an exit record. If the stream
-// has already been given one, this only closes the stream. An exit record
-// pushed by another source concurrently may still shut down the run abruptly.
+// has already been given one, this only closes the stream. Otherwise, any
+// exit record the client sends afterwards is dropped.
 //
 // This is used to shut down the stream if the client didn't do it explicitly.
 func (s *Stream) FinishAndClose(exitCode int32) {
@@ -320,11 +353,12 @@ func (s *Stream) FinishAndClose(exitCode int32) {
 	// transaction log, and syncing the log later would fail on it.
 	//
 	// The client's exit record may not be queued yet, for example while
-	// the TensorBoard integration finishes. Closing before then would
-	// drop it, so wait.
-	if queued := s.exitQueued.Load(); queued != nil {
+	// it is parsed or while the TensorBoard integration finishes. Closing
+	// before then would drop it, so wait.
+	queued := s.claimExit()
+	if queued == nil {
 		s.logger.Info("stream: already received exit, closing")
-		<-*queued
+		<-*s.exitQueued.Load()
 		s.Close()
 		s.printFooter()
 		return
@@ -340,12 +374,12 @@ func (s *Stream) FinishAndClose(exitCode int32) {
 		exitResponse,
 	)
 
-	s.HandleRecord(&spb.Record{
+	s.scheduleRecord(&spb.Record{
 		RecordType: &spb.Record_Exit{
 			Exit: &spb.RunExitRecord{
 				ExitCode: exitCode,
 			}},
-	}, exitRequest)
+	}, exitRequest, queued)
 
 	// Wait until all uploads complete (or, if this is a duplicate exit,
 	// until it is rejected by the Sender).
